@@ -15,10 +15,12 @@ msgstr ""
 " the terminal. After the names are merged, some terminals may be offline"
 " and need to be reconnected."
 
+msgid "Wi-Fi 5 兼容模式"
+msgstr "Wi-Fi 5 compatibility mode"
+
 msgid ""
 "某些老设备对Wi-Fi6支持不好，可能扫描不到信号或者连接不上等。开启此开关后，将会切"
-"换到Wi-Fi5模式，解决兼容问题。但同时会关闭Wi-Fi6的相关功能，如OFDMA，BSS Coloring等。
-                "
+"换到Wi-Fi5模式，解决兼容问题。但同时会关闭Wi-Fi6的相关功能，如OFDMA，BSS Coloring等"
 msgstr ""
 "Some older devices do not support Wi-Fi 6 (802.11ax) properly and may not"
 " scan the signal or connect, etc. Once enabled, it will switch to Wi-Fi 5"
@@ -37,14 +39,14 @@ msgid "启用此功能后，Redmi路由器将开启IPv6上网功能（使用前�
 msgstr ""
 "With this function enabled, the Redmi router will enable the IPv6 Internet"
 " connection function (please contact the network provider to verify that it"
-" supports IPv6 before use)"
+" supports IPv6 before use)."
 
 msgid "Mesh模式下不支持切换为中继模式。"
 "To ensure the best possible user experience, switching to Repeater mode is"
 " not supported in Mesh mode."
 
 msgid "Mesh模式下不支持切换为路由模式。"
-msgstr "To ensure user experience, switching to Relay mode is not supported in Mesh mode"
+msgstr "To ensure user experience, switching to Relay mode is not supported in Mesh mode."
 
 # ============= data from www files ==============
 
