@@ -6,11 +6,12 @@ import sys
 import re
 import types
 import binascii
+import random
 import tarfile
 import io
 import requests
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import xmir_base
 import gateway
 from gateway import die
 from envbuffer import EnvBuffer
@@ -30,7 +31,9 @@ class Bootloader():
   spi_rom = False
 
 class BaseInfo():
+  linux_stamp = None
   linux_ver = None
+  linux_arch = None
   cpu_arch = None
   cpu_name = None
   spi_rom = False
@@ -51,6 +54,8 @@ class DevInfo():
   dmesg = None     # text
   info = BaseInfo()
   partlist = []    # list of {addr, size, name}
+  allpartnum = -1  # "ALL" partition number
+  kcmdline_s = ""  # original kernel command line
   kcmdline = {}    # key=value
   nvram = {}       # key=value
   rootfs = RootFS()
@@ -78,7 +83,8 @@ class DevInfo():
       self.get_dmesg()
       self.get_part_table()
       if not self.partlist or len(self.partlist) <= 1:
-        die("Partition list is empty!")
+        die("Partition list is empty! (solution: disable all WiFi modules and reboot device)")
+      self.get_kernel_cmdline()
       self.get_rootfs()
       self.get_baseinfo()
       if not self.info.cpu_arch:
@@ -86,77 +92,266 @@ class DevInfo():
     if infolevel >= 2:
       self.get_ver()
     if infolevel >= 3:
-      self.get_kernel_cmdline()
       self.get_nvram()
     if infolevel >= 4:
       self.get_bootloader()
     if infolevel >= 5:
       self.get_env_list()
 
-  def get_dmesg(self, verbose = None):
-    verbose = verbose if verbose is not None else self.verbose
-    self.dmesg = None
-    fn_local  = 'outdir/dmesg.log'
-    fn_remote = '/tmp/dmesg.log'
+  def run_command(self, cmd, fn = None, encoding = "latin_1", binary = False, verbose = 1):
+    if not fn:
+      fn = hex(random.getrandbits(64)) + '.txt'
+      fn = fn[1:]
+    fn_local  = f'outdir/{fn}'
+    fn_remote = f'/tmp/{fn}'
     if os.path.exists(fn_local):
       os.remove(fn_local)
+    if '>' not in cmd:
+      cmd += " > " + fn_remote
     try:
-      self.gw.run_cmd("dmesg > " + fn_remote)
-      self.gw.download(fn_remote, fn_local)
+      self.gw.run_cmd(cmd)
+      self.gw.download(fn_remote, fn_local, verbose = verbose)
       self.gw.run_cmd("rm -f " + fn_remote)
     except Exception:
       return None
     if not os.path.exists(fn_local):
       return None
-    if os.path.getsize(fn_local) <= 1:
+    if os.path.getsize(fn_local) <= 0:
       return None
-    with open(fn_local, "r", encoding="latin_1") as file:
-      self.dmesg = file.read()
+    openmode = 'rb' if binary else 'r'
+    with open(fn_local, openmode, encoding = encoding) as file:
+      output = file.read()
+    return output    
+  
+  def get_dmesg(self, verbose = None):
+    verbose = verbose if verbose is not None else self.verbose
+    self.dmesg = self.run_command('dmesg', 'dmesg.log')
+    if self.dmesg is None:
+      print(f'ERROR on downloading "/tmp/dmesg.log"')
     return self.dmesg
 
-  def get_part_table(self, verbose = None):
-    verbose = verbose if verbose is not None else self.verbose
-    self.partlist = []
+  def get_part_addr_dmesg(self, partlist):
     if not self.dmesg:
-      return self.partlist
+      return -1
     x = self.dmesg.find(" MTD partitions on ")
     if x <= 0:
-      return self.partlist
+      return -2
     parttbl = re.findall(r'0x0000(.*?)-0x0000(.*?) : "(.*?)"', self.dmesg)
     if len(parttbl) <= 0:
-      return self.partlist
-    if verbose:
-      print("MTD partitions:")
+      return -3
+    k = 0
     for i, part in enumerate(parttbl):
       addr = int(part[0], 16)
       size = int(part[1], 16) - addr
       name = part[2]
-      self.partlist.append({'addr': addr, 'size': size, 'name': name})
+      for p, data in enumerate(partlist):
+        if data['name'] == name:
+          #print(f"{name:12S}: {addr:08X} {size:08X}")
+          if size != data['size']:
+            x = self.dmesg.find(f'mtd: partition "{name}" extends beyond the end of device "')
+            if x <= 0:
+              raise ValueError(f"Incorrect size into partition table ({name})")
+          if addr != data['addr'] and data['addr'] >= 0:
+            raise ValueError(f"Incorrect addr for partition ({name})")
+          if data['addr'] < 0:
+            data['addr'] = addr
+            k += 1
+    return k
+
+  def get_part_table(self, verbose = None):
+    verbose = verbose if verbose is not None else self.verbose
+    self.partlist = [ ]
+    self.allpartnum = -1
+    mtd_list = self.run_command('cat /proc/mtd', 'mtd_list.txt')
+    if not mtd_list or len(mtd_list) <= 1:
+      return [ ]
+    mtdtbl = re.findall(r'mtd([0-9]+): ([0-9a-fA-F]+) ([0-9a-fA-F]+) "(.*?)"', mtd_list)
+    if len(mtdtbl) <= 1:
+      return [ ]
+    mtd_max_num = max( [ int(mtd[0]) for i, mtd in enumerate(mtdtbl) ] )
+    partlist = [ { 'addr': -1, 'size': -1, 'name': None } for i in range(mtd_max_num + 1) ]
+    mtd_info = self.get_part_info(mtd_max_num, verbose)
+    for i, mtd in enumerate(mtdtbl):
+      mtdid = int(mtd[0])
+      addr = -1
+      size = int(mtd[1], 16)
+      name = mtd[3]
+      if mtd_info and mtdid < len(mtd_info):
+        if mtd_info[mtdid]["addr"] is not None:
+          addr = mtd_info[mtdid]["addr"]
+      partlist[mtdid]['addr'] = addr
+      partlist[mtdid]['size'] = size
+      partlist[mtdid]['name'] = name
+      pass
+    self.get_part_addr_dmesg(partlist)
+    if partlist[0]['addr'] < 0:
+      if partlist[0]['name']:
+        if partlist[0]['size'] > 0x00800000:  # 8MiB
+          partlist[0]['addr'] = 0  # detect "ALL" part
+    if partlist[0]['addr'] == 0:
+      if partlist[0]['size'] > 0x00800000:  # 8MiB:
+        self.allpartnum = 0  # detect "ALL" part
+    fdt_info = self.get_part_from_fdt(partlist, verbose)
+    if self.verbose:
+      print("MTD partitions:")
+    err_addr = -1
+    for i, part in enumerate(partlist):
+      size = part['size']
+      name = part['name']
+      if part['addr'] < 0:
+        if name in fdt_info:
+          if size == fdt_info[name]['size']:
+            part['addr'] = fdt_info[name]['addr']
+      if part['addr'] < 0:
+        if name == "m25p80":
+          part['addr'] = 0xFFFFFFFF
+        else:
+          if self.dmesg and re.search(f'mounted UBI device ., volume ., name "{name}"', self.dmesg):
+            part['addr'] = 0xFFFFFFFF
+      if part['addr'] < 0 and fdt_info:
+        part['addr'] = 0xFFFFFFFF
+      addr = part['addr']
+      if mtd_info and i < len(mtd_info):
+        if mtd_info[i]["ro"] is not None:
+          part['ro'] = False if mtd_info[i]["ro"] == 0 else True
       if verbose:
-        print('  %2d > addr: 0x%08X  size: 0x%08X  name: "%s"' % (i, addr, size, name))
+        xaddr = ("0x%08X" % addr) if addr >= 0 else "??????????"
+        ro = '?'
+        if 'ro' in part:
+          ro = '0' if part['ro'] == False else '1'
+        print('  %2d > addr: %s  size: 0x%08X  ro:%s  name: "%s"' % (i, xaddr, size, ro, name))
+      if addr < 0:
+        err_addr = mtdid
     if verbose:
       print(" ")
+    if err_addr >= 0:
+      return [ ]
+    self.partlist = partlist
     return self.partlist
+
+  def get_part_info(self, mtd_max_num, verbose = None):
+    verbose = verbose if verbose is not None else self.verbose
+    fn = 'mtd_info.txt'
+    mtd_dev = '/sys/class/mtd/mtd$i'
+    dn = '2>/dev/null'
+    trim = r"tr -d '\n'"
+    a2f = f"tee -ia /tmp/{fn}"  # append to file
+    delim = f"echo -n '|' >> /tmp/{fn}"
+    cmd  = f'rm -f /tmp/{fn} ;'
+    cmd += f'for i in $(seq 0 {mtd_max_num}) ; do'
+    cmd += f'  echo "" >> /tmp/{fn} ;'
+    cmd += f'  echo -n $i= >> /tmp/{fn} ;'
+    cmd += f"  cat {mtd_dev}/offset {dn} | {trim} | {a2f} ; {delim} ;"
+    cmd += f"  cat {mtd_dev}/type   {dn} | {trim} | {a2f} ; {delim} ;"
+    cmd += f"  cat {mtd_dev}/flags  {dn} | {trim} | {a2f} ; {delim} ;"
+    cmd += f"  cat {mtd_dev}/mtdblock$i/ro  {dn} | {trim} | {a2f} ; {delim} ;"
+    cmd += f"  cat {mtd_dev}/dev    {dn} | {trim} | {a2f} ; {delim} ;"
+    cmd += f"  readlink -f {mtd_dev}/device {dn} | {trim} | {a2f} ; {delim} ;"
+    cmd += f"  mtd -l 1 dump /dev/mtd$i {dn} | wc -c | {trim} | {a2f} ; {delim} ;"
+    cmd += f'done'
+    out_text = self.run_command(cmd, fn)
+    if not out_text:
+      return [ ]
+    info = [ { "addr": None, "ro": None } for i in range(mtd_max_num + 1) ]
+    for line in out_text.split('\n'):
+      line = line.strip()
+      if '=' in line:
+        data = line.split('=')
+        mtd_num = int(data[0])
+        mtd_info = data[1].split('|')
+        info[mtd_num]["addr"]   = int(mtd_info[0], 0) if len(mtd_info[0]) > 0 else None
+        info[mtd_num]["type"]   = mtd_info[1].strip()
+        info[mtd_num]["flags"]  = int(mtd_info[2], 0) if len(mtd_info[2]) > 0 else None
+        info[mtd_num]["ro"]     = 0 if mtd_info[6] == '1' else 1
+        info[mtd_num]["dev"]    = mtd_info[4].strip()
+        info[mtd_num]["device"] = mtd_info[5].strip()
+    return info    
+
+  def get_part_from_fdt(self, partlist, verbose = None):
+    verbose = verbose if verbose is not None else self.verbose
+    fn = 'mtd_fdt.txt'
+    fdtpath = '/sys/firmware/devicetree/base/**/'
+    execgrep = '-exec grep -l "^fixed-partitions" {} +'
+    hexfmt = "'1/1 \"%02x\"'"
+    trim = r"tr -d '\n'"
+    cmd  = f'fn=/tmp/{fn};'
+    cmd += f'rm -f $fn;'
+    cmd += f'dlist=$( find {fdtpath} -type f -name compatible {execgrep} );'
+    cmd += f'[ -z "$dlist" ] && dlist=$( find {fdtpath} -type f -name nand-bus-width );'
+    cmd += f'for trgfile in $dlist ; do'
+    cmd += f'  bdir=$( dirname $trgfile );'
+    cmd += f'  echo "" >>$fn;'
+    cmd += f'  echo "PARTLIST:$bdir" >>$fn;'
+    cmd += f'  plist=$( find $bdir/**/ -mindepth 1 -maxdepth 1 -type f -name label );'
+    cmd += f'  for label in $plist ; do'
+    cmd += f'    pdir=$( dirname $label );'
+    cmd += f'    preg=$( cat $pdir/reg | hexdump -v -n8 -e {hexfmt} );'  # bigendian
+    cmd +=  '    echo "0x${preg:0:8}|0x${preg:8:8}|$(cat $label | tr -d ''\\n'')" >>$fn;'
+    cmd += f'  done;'
+    cmd += f'done'
+    fdt_text = self.run_command(cmd, fn)
+    if not fdt_text:
+      return { }
+    fdt_dev = [ ]
+    mtd_list = None
+    for line in fdt_text.split('\n'):
+      line = line.strip()
+      if line.startswith('PARTLIST:'):
+        if mtd_list:
+          fdt_dev.append(mtd_list)
+        mtd_list = { }
+      if line.startswith('0x'):
+        data = line.split('|')
+        name = data[2].strip()
+        if name:
+          mtd_list[name] = { 'addr': int(data[0], 0), 'size': int(data[1], 0) }
+    if mtd_list:
+      fdt_dev.append(mtd_list)
+    if not fdt_dev:
+      return { }
+    if len(fdt_dev) == 1:
+      return fdt_dev[0]
+    scores = [ 0 ] * len(fdt_dev)
+    for i, mtd_list in enumerate(fdt_dev):
+      for _, (name, mtd) in enumerate(mtd_list.items()):
+        for part in partlist:
+          if part['name'] == name and part['size'] == mtd['size']:
+            if part['addr'] == mtd['addr']:
+              scores[i] += 1
+            elif part['addr'] < 0:
+              pass #nothing
+            else:
+              scores[i] -= 1
+    max_scores = max(scores)
+    if max_scores <= 0:
+      return { }
+    devnum = scores.index(max_scores)
+    return fdt_dev[devnum]
 
   def get_part_num(self, name_or_addr, comptype = None):
     if not self.partlist:
       return -2
-    for i, part in enumerate(self.partlist):
-      if isinstance(name_or_addr, int):
-        if part['addr'] == 0 and part['size'] > 0x00800000:
+    if isinstance(name_or_addr, int):
+      addr = name_or_addr
+      for i, part in enumerate(self.partlist):
+        if self.allpartnum >= 0 and i == self.allpartnum:
           continue  # skip "ALL" part
-        addr = name_or_addr
         if comptype and comptype == '#':  # range
           if addr >= part['addr'] and addr < part['addr'] + part['size']:
             return i
         else:
           if addr == part['addr']:
             return i
-      else:   
+    if isinstance(name_or_addr, str):
+      name = name_or_addr.lower()
+      for i, part in enumerate(self.partlist):
+        partname = part['name'].lower()
+        if len(partname) > 2 and partname[1:2] == ':':
+          partname = partname[2:]
         if comptype and comptype[0] == 'e':  # endswith
-          if part['name'].lower().endswith(name_or_addr.lower()):
+          if partname.endswith(name):
             return i
-        if part['name'].lower() == name_or_addr.lower():
+        elif partname == name:
           return i
     return -1
 
@@ -182,39 +377,42 @@ class DevInfo():
   def get_rootfs(self, verbose = None):
     verbose = verbose if verbose is not None else self.verbose
     self.rootfs = RootFS()
-    if not self.dmesg:
+    if not self.kcmdline_s and not self.dmesg:
       return self.rootfs
-    # flag_boot_rootfs=0 mounting /dev/mtd10 
-    x = re.search(r'flag_boot_rootfs=([0-9]) mounting (\S+)', self.dmesg)
-    if x:
-      self.rootfs.num = int(x.group(1))
-      self.rootfs.mtd_dev = x.group(2)
-    # UBI: attached mtd10 (name "rootfs0", size 32 MiB) to ubi0 
-    x = re.search(r'attached mtd([0-9]+) \(name "(.*?)", size', self.dmesg)
-    if x and x.group(2).lower().startswith('rootfs'):
-      self.rootfs.mtd_num = int(x.group(1))
-      self.rootfs.partition = x.group(2).strip()
-    # mtd: device 11 (rootfs) set to be root filesystem
-    x = re.search(r'mtd: device ([0-9]+) \(rootfs\) set to be root filesystem', self.dmesg)
-    if x:
-      self.rootfs.mtd_num = int(x.group(1))
+    kcmdline = f'Kernel command line: {self.kcmdline_s} \n'
+    if self.dmesg:
+      # flag_boot_rootfs=0 mounting /dev/mtd10 
+      x = re.search(r'flag_boot_rootfs=([0-9]) mounting (\S+)', self.dmesg)
+      if x:
+        self.rootfs.num = int(x.group(1))
+        self.rootfs.mtd_dev = x.group(2)
+      # UBI: attached mtd10 (name "rootfs0", size 32 MiB) to ubi0 
+      x = re.search(r'attached mtd([0-9]+) \(name "(.*?)", size', self.dmesg)
+      if x and x.group(2).lower().startswith('rootfs'):
+        self.rootfs.mtd_num = int(x.group(1))
+        self.rootfs.partition = x.group(2).strip()
+      # mtd: device 11 (rootfs) set to be root filesystem
+      x = re.search(r'mtd: device ([0-9]+) \(rootfs\) set to be root filesystem', self.dmesg)
+      if x:
+        self.rootfs.mtd_num = int(x.group(1))
     if self.rootfs.num is None:
-      k = re.search(r'Kernel command line:(.*?) ubi\.mtd=(\S+)', self.dmesg)   # ([^\s]+)
+      k = re.search(r'Kernel command line:(.*?) ubi\.mtd=(\S+)', kcmdline)   # ([^\s]+)
       if k:
         self.rootfs.partition = k.group(2)
     if self.rootfs.num is None:
-      k = re.search(r'Kernel command line:(.*?) firmware=([0-9])', self.dmesg)
+      k = re.search(r'Kernel command line:(.*?) firmware=([0-9])', kcmdline)
       if k:
         self.rootfs.num = int(k.group(2))
     if self.rootfs.num is None and self.rootfs.mtd_num is None:
-      x = re.search(r'Kernel command line:(.*?) root=(\S+)', self.dmesg)
+      x = re.search(r'Kernel command line:(.*?) root=(\S+)', kcmdline)
       if x and x.group(2).startswith('/dev/mtdblock'):
         self.rootfs.mtd_dev = x.group(2) 
         self.rootfs.mtd_num = int(self.rootfs.mtd_dev.replace('/dev/mtdblock', ''))
     if self.rootfs.num is None and self.rootfs.partition:
-      if self.rootfs.partition.lower().startswith('rootfs'):
+      pname = self.rootfs.partition.lower()
+      if pname.startswith('rootfs') or pname.startswith('firmware') or pname.startswith('ubi'):
         self.rootfs.num = 0
-        if self.rootfs.partition.endswith('1'):
+        if pname.endswith('1'):
           self.rootfs.num = 1
     if verbose:
       print('RootFS info:')
@@ -236,6 +434,12 @@ class DevInfo():
       x = re.search(r'Linux version (.*?) ', self.dmesg)
       if x:
         ret.linux_ver = x.group(1).strip()
+    kernel_version = self.get_kernel_version(verbose = verbose)
+    if not ret.linux_ver:
+      if kernel_version:
+        ret.linux_ver = kernel_version
+    ret.linux_stamp = self.kernel_ver_stamp
+    ret.linux_arch = self.kernel_arch
     if verbose:
       print('  Linux version: {}'.format(ret.linux_ver))
     fn_local  = 'outdir/openwrt_release.txt'
@@ -287,6 +491,19 @@ class DevInfo():
       cpu_arch = 'arm64'
     if cpu_name.startswith('ipq60'):
       cpu_arch = 'arm64'
+    if cpu_name.startswith('ipq95'):
+      cpu_arch = 'arm64'
+    x = re.search("DISTRIB_ARCH=['\"](.*?)['\"]", txt)
+    if x:
+      if verbose:
+        print("  DISTRIB_ARCH =", x.group(1))
+      arch = x.group(1)
+      if arch.startswith("mips_") or arch.startswith("mipsel_") or arch.startswith("ramips_"):
+        cpu_arch = 'mips'
+      if arch.startswith("arm_"):
+        cpu_arch = 'armv7'
+      if arch.startswith("aarch64_"):
+        cpu_arch = 'arm64'      
     ret.cpu_arch = cpu_arch if cpu_arch else None
     ret.cpu_name = cpu_name if cpu_name else None
     if verbose:
@@ -305,6 +522,7 @@ class DevInfo():
 
   def get_kernel_cmdline(self, verbose = None, retdict = True):
     verbose = verbose if verbose is not None else self.verbose
+    self.kcmdline_s = ""
     self.kcmdline = {} if retdict else None
     fn_local  = 'outdir/kcmdline.log'
     fn_remote = '/tmp/kcmdline.log'
@@ -318,21 +536,50 @@ class DevInfo():
       return self.kcmdline
     if os.path.getsize(fn_local) <= 1:
       return self.kcmdline
-    with open(fn_local, "r", encoding="latin_1") as file:
+    with open(fn_local, "rb") as file:
       data = file.read()
+    data = data.replace(b"\n", b' ')
+    data = data.replace(b"\x00", b' ')
+    data = data.decode('latin_1')
+    data = data.strip()
+    self.kcmdline_s = data
     if verbose:
       print("Kernel command line:")
       print(" ", data)
     if not retdict:
       return data
-    data = data.strip()
-    data = data.replace("\n", ' ')
-    data = data.replace("\x00", ' ')
-    data = data.strip()
     env = EnvBuffer(data, ' ', crc_prefix = False, encoding = 'latin_1')
     self.kcmdline = env.var
     #self.kcmdline = type("Names", [object], self.kcmdline)
     return self.kcmdline
+
+  def get_kernel_version(self, verbose = None):
+    verbose = verbose if verbose is not None else self.verbose
+    self.kernel_ver_stamp = None
+    self.kernel_version = None
+    self.kernel_buildver = None
+    self.kernel_arch = None
+    fn = 'kver.txt'
+    cmd  = f'uname -a  > /tmp/{fn} ; '   # Linux XiaoQiang 5.4.213 #0 SMP PREEMPT Tue Feb 18 11:11:56 2025 armv7l GNU/Linux
+    cmd += f'uname -r >> /tmp/{fn} ; '   # 5.4.213
+    cmd += f'uname -v >> /tmp/{fn} ; '   # #0 SMP PREEMPT Tue Feb 18 11:11:56 2025
+    cmd += f'uname -m >> /tmp/{fn} ; '   # armv7l
+    cmd += f'uname -p >> /tmp/{fn} ; '   # <Processor type>
+    out_text = self.run_command(cmd, fn)
+    if not out_text:
+        return None
+    #if 'Linux' not in out_text:
+    #    return None
+    out_lines = out_text.split('\n')
+    if len(out_lines) < 4:
+        return None
+    self.kernel_ver_stamp = out_lines[0].strip()
+    self.kernel_version = out_lines[1].strip()
+    self.kernel_buildver = out_lines[2].strip()
+    self.kernel_arch = out_lines[3].strip()
+    if verbose:
+        print(f"  Kernel version: {self.kernel_ver_stamp}")
+    return self.kernel_version
 
   def get_nvram(self, verbose = None, retdict = True):
     verbose = verbose if verbose is not None else self.verbose
@@ -458,6 +705,48 @@ class DevInfo():
       print("")
     return self.ver
 
+  def get_md5_for_mtd_data(self, partname, offset = 0, size = None):
+    if not self.partlist:
+        return -10
+    mtd_num = self.get_part_num(partname)
+    if mtd_num < 0:
+        return -9 
+    mtd_part = self.partlist[mtd_num]
+    bs = 4096
+    if not size:
+        size = mtd_part['size']
+    if size > mtd_part['size']:
+        return -8
+    if size % bs != 0:
+        return -7
+    if offset % bs != 0:
+        return -6
+    skip = f'skip={offset // bs}' if offset else ''
+    num = str(random.randint(10000, 1000000))
+    md5_local_fn = f"tmp/mtd{mtd_num}_{offset}_{size}_{num}.md5"
+    md5_remote_fn = f"/tmp/mtd{mtd_num}_{offset}_{size}_{num}.md5"
+    count = size // bs
+    cmd = f'dd if=/dev/mtd{mtd_num} bs={bs} count={count} {skip} | md5sum > "{md5_remote_fn}" '
+    try:
+        self.gw.run_cmd(cmd)
+        self.gw.download(md5_remote_fn, md5_local_fn)
+    except Exception:
+        return -5
+    if not os.path.exists(md5_local_fn):
+        return -4
+    with open(md5_local_fn, 'r', encoding = 'latin1') as file:
+        md5 = file.read()
+    os.remove(md5_local_fn)
+    if not md5:
+        return -3
+    if md5.startswith('md5sum:'):
+        return -2
+    md5 = md5.split(' ')[0]
+    md5 = md5.strip()
+    if len(md5) != 32:
+        return -1
+    return md5.lower()
+
   def get_bootloader(self, verbose = None):
     verbose = verbose if verbose is not None else self.verbose
     self.bl = Bootloader()
@@ -465,7 +754,8 @@ class DevInfo():
     ret = self.bl
     if verbose:
       print("Bootloader info:")
-    plst = self.get_part_list(['bootloader', 'uboot', 'SBL1', 'APPSBL', 'SBL2', 'SBL3'], comptype = 'ends')
+    blist = ['bootloader', 'uboot', 'SBL1', 'APPSBL', 'SBL2', 'SBL3', 'BL2', 'FIP']
+    plst = self.get_part_list(blist)
     if not plst:
       return ret
     for i, p in enumerate(plst):  
@@ -542,7 +832,8 @@ class DevInfo():
     ret = self.env.fw
     if verbose:
       print("ENV info:")
-    plst = self.get_part_list(['config', 'nvram', 'APPSBLENV', 'bdata'], comptype = 'ends')
+    envlist = ['config', 'nvram', 'APPSBLENV', 'bdata']
+    plst = self.get_part_list(envlist)
     if not plst:
       return ret
     env_breed_addr = 0x60000  # breed env addr for r3g
@@ -567,7 +858,7 @@ class DevInfo():
       else:
         env.addr = part['addr']
         data_size = part['size']
-      env.max_size = data_size  
+      env.max_size = data_size
       fn_local  = 'outdir/mtd{id}_{name}.bin'.format(id=p, name=name)
       fn_remote = '/tmp/env_{name}.bin'.format(name=name)
       if part['size'] < 128*1024:
@@ -647,8 +938,12 @@ class DevInfo():
       data = data[4:end+1]
       env.delim = '\x00'
       env.crc_prefix = False
-      env.encoding = 'ascii'
-      env.var = env.parse_env_b(data, env.delim, encoding = env.encoding)
+      try:
+        env.encoding = 'UTF-8'
+        env.var = env.parse_env_b(data, env.delim, encoding = env.encoding)
+      except Exception:
+        env.encoding = 'latin_1'
+        env.var = env.parse_env_b(data, env.delim, encoding = env.encoding)
       env.crc_prefix = True
       if verbose >= 2 and env.var:
         for i, (k, v) in enumerate(env.var.items()):
@@ -705,11 +1000,11 @@ class SysLog():
       die("Xiaomi Mi Wi-Fi device not found (IP: {})".format(gw.ip_addr))
     if self.verbose > 0:
       print("Start generating syslog...")
-    r2 = requests.get(gw.apiurl + "misystem/sys_log", timeout = timeout)
-    if r2.text.find('"code":0') < 0:
+    r2 = gw.api_request("API/misystem/sys_log", resp = 'text', timeout = timeout)
+    if '"code":0' not in r2:
       die("SysLog not generated!")
     try:
-      path = re.search(r'"path":"(.*?)"', r2.text)
+      path = re.search(r'"path":"(.*?)"', r2)
       path = path.group(1).strip()
     except Exception:
       die("SysLog not generated! (2)")
@@ -805,7 +1100,11 @@ class SysLog():
     file = self.get_file_by_name('bdata.txt', fatal_error)
     if not file:
       return None
-    env = EnvBuffer(file.data.decode('ascii'), '\n')
+    try:
+      data = file.data.decode('UTF-8')
+    except Exception:
+      data = file.data.decode('latin_1')
+    env = EnvBuffer(data, '\n')
     if self.verbose >= 2:
       print('SysLog BData List:')
       for i, (k, v) in enumerate(env.var.items()):
@@ -834,15 +1133,20 @@ if __name__ == "__main__":
     os.rename(fn_local, fn_old)
 
   info = DevInfo(verbose = 1, infolevel = 99)
-  #if not info.partlist:
-  #  die("В ядерном логе не обнаружена информация о разметке NAND")
 
   file = open(fn_local, "w")
   file.write("_MTD_partitions_:\n")
   for i, part in enumerate(info.partlist):
-    file.write("  %2d > addr: %08X  size: %08X  name: \"%s\" \n" % (i, part['addr'], part['size'], part['name']))
+    name = part['name']
+    addr = "%08X" % part['addr']
+    size = "%08X" % part['size']
+    ro = "?"
+    if 'ro' in part:
+      ro = '1' if part['ro'] else '0'
+    file.write(f'  {"%2d" % i} > addr: {addr}  size: {size}  ro: {ro}  name: "{name}" \n')
   file.write("\n")  
   file.write("_Base_info_:\n")
+  file.write('  Linux stamp: {}\n'.format(info.info.linux_stamp))
   file.write('  Linux version: {}\n'.format(info.info.linux_ver))
   file.write('  CPU arch: {}\n'.format(info.info.cpu_arch))
   file.write('  CPU name: {}\n'.format(info.info.cpu_name))

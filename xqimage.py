@@ -8,7 +8,7 @@ import platform
 import ctypes
 import binascii
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import xmir_base
 from envbuffer import *
 
 
@@ -29,80 +29,8 @@ class XQImgFile(ctypes.Structure):
               ("dummy",   ctypes.c_short),
               ("name",    ctypes.c_char * 32)] # Filename
 
-xqModelList = [
-  "<unk0>",
-  "<unk1>",
-  "<unk2>",
-  "R1CM",    # 3
-  "R2D",     # 4
-  "R1CL",
-  "R2CM",
-  "R3",
-  "R3D",     # 8
-  "R3L",
-  "R3P",     # 10
-  "P01",
-  "R3A",
-  "R3G",     # 13
-  "R4",
-  "R4C",
-  "D01",
-  "R4A",
-  "R4CM",
-  "R4AC",
-  "R3GV2",   # 20
-  "R2600",
-  "R2100",   # 22
-  "RM2100",  # 23
-  "R3600",   # 24
-  "R1350",
-  "R2200",
-  "R2350",   # 27
-  "IR1200G",
-  "RM1800",
-  "R2100D",  # 30
-  "RA67",
-  "RA69",
-  "RA71",
-  "CR6006",  # 34
-  "CR6008",
-  "CR6009",
-  "RA70",
-  "RA75",
-  "RA72",
-  "<unk40>", # 40
-  "<unk41>",
-  "<unk42>",
-  "RA80",           # AX3000 (CN)
-  "RA81",           # Redmi AX3000
-  "RA82",           # AX3000 (INT)
-  "RA83",
-  "RA74",           # AX5400
-  "<unk48>",
-  "YY01",
-  "RB01",    # 50   # AX3200 (INT)
-  "RB03",    # 51   # AX6S
-  "<unk52>",
-  "<unk53>",
-  "RB04",    # 54   # Redmi AX5400
-  "<unk55>",
-  "<unk56>",
-  "<unk57>",
-  "RB08",    # 58   # HomeWiFi
-  "<unk59>",
-  "<unk60>",
-  "RB06",    # 61   # Redmi AX6000
-  "<unk62>",
-  "<unk63>",
-  "CB04",    # 64
-  "CB0401",  # 65
-]
-
-def get_modelid_by_name(name):
-  for i, m in enumerate(xqModelList):
-    if m.lower() == name.lower():
-      return i
-  return -1
+from xqmodel import xqModelList
+from xqmodel import get_modelid_by_name
 
 def DIE(msg):
   print('ERROR:', msg)

@@ -4,7 +4,7 @@
 import os
 import sys
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import xmir_base
 import gateway
 from gateway import die
 import read_info
@@ -34,6 +34,14 @@ def breed_boot_change(gw, dev, fw_num, fw_addr, fw_name):
   if env.data is None or env.max_size is None:
     die("Can't found breed env address!")
   env.var['autoboot.command'] = "boot flash 0x%X" % fw_addr
+  cmdline = 'uart_en=1'
+  if 'linux.cmdline' in env.var:
+    cmdline = env.var['linux.cmdline']    
+    if 'uart_en=' in cmdline:
+      cmdline = cmdline.replace('uart_en=0', 'uart_en=1')
+    else:
+      cmdline += ' uart_en=1'
+  env.var['linux.cmdline'] = cmdline
   print("Breed ENV params for update:")
   for i, (k, v) in enumerate(env.var.items()):
     v = '' if (v is None) else ('=' + v)
@@ -72,8 +80,8 @@ def uboot_boot_change(gw, fw_num):
   cmd.append("nvram set flag_try_sys2_failed=0")
   cmd.append("nvram set flag_boot_rootfs={}".format(fw_num))
   cmd.append("nvram commit")
-  gw.run_cmd(cmd)
-  return True
+  out = gw.run_cmd(';'.join(cmd))
+  return False if out is None else True
 
 
 if __name__ == "__main__":

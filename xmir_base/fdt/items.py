@@ -39,17 +39,17 @@ def new_property(name: str, raw_value: bytes) -> object:
                 obj.append(st)
         return obj
 
-    elif len(raw_value) and len(raw_value) % 4 == 0:
+    elif len(raw_value) > 0 and len(raw_value) <= 256*1024 and len(raw_value) % 4 == 0:
         obj = PropWords(name)
         # Extract words from raw value
         obj.data = [BIGENDIAN_WORD.unpack(raw_value[i:i + 4])[0] for i in range(0, len(raw_value), 4)]
+        obj.raw_value = raw_value
         return obj
 
     elif len(raw_value):
         return PropBytes(name, data=raw_value)
 
-    else:
-        return Property(name)
+    return Property(name)
 
 
 ########################################################################################################################
@@ -80,7 +80,7 @@ class BaseItem:
             node = node.parent
         return path if path else '/'
 
-    def __init__(self, name: str):
+    def __init__(self, name: str, label=None):
         """ 
         BaseItem constructor
         
@@ -89,7 +89,7 @@ class BaseItem:
         assert isinstance(name, str)
         assert all(c in printable for c in name), "The value must contain just printable chars !"
         self._name = name
-        self._label = None
+        self._label = label
         self._parent = None
 
     def __str__(self):
@@ -511,6 +511,10 @@ class Node(BaseItem):
     """Node representation"""
 
     @property
+    def path(self):
+        return super().path + '/' + self.name
+
+    @property
     def props(self):
         return self._props
 
@@ -522,14 +526,14 @@ class Node(BaseItem):
     def empty(self):
         return False if self.nodes or self.props else True
 
-    def __init__(self, name, *args):
+    def __init__(self, name, *args, label=None):
         """ 
         Node constructor
         
         :param name: Node name
         :param args: List of properties and subnodes
         """
-        super().__init__(name)
+        super().__init__(name, label=label)
         self._props = []
         self._nodes = []
         for item in args:
@@ -557,7 +561,7 @@ class Node(BaseItem):
 
     def copy(self):
         """ Create a copy of Node object """
-        node = Node(self.name)
+        node = Node(self.name, label=self.label)
         for p in self.props:
             node.append(p.copy())
         for n in self.nodes:
